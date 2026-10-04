@@ -1,1 +1,115 @@
+"""Core rule tests. Run: python -m pytest -q"""
+from datetime import date, timedelta
+
+import pandas as pd
+import pytest
+
+from qatra.matching import (COMPATIBLE_DONORS, add_eligibility, is_eligible,
+                            plan_recurring, rank_donors)
+from qatra.privacy import (ContactRelay, RateLimitExceeded, distance_bucket,
+                           hospital_view, request_ref)
+
+TODAY = date(2026, 10, 4)
+
+
+def donor(i, bt="O+", days_ago=None, avail="Available now", lat=31.52, lon=74.36, rr=0.6):
+    return {"donor_id": f"D{i:04d}", "blood_type": bt, "city": "Lahore", "lat": lat, "lon": lon,
+            "last_donation": None if days_ago is None else TODAY - timedelta(days=days_ago),
+            "availability": avail, "response_rate": rr, "last_contacted": None,
+            "consent_matching": True, "consent_contact": True}
+
+
+# --- 90-day rule -----------------------------------------------------------
+@pytest.mark.parametrize("days,ok", [(None, True), (89, False), (90, True), (200, True), (0, False)])
+def test_ninety_day_rule(days, ok):
+    last = None if days is None else TODAY - timedelta(days=days)
+    assert is_eligible(last, TODAY) is ok
+    df = add_eligibility(pd.DataFrame([donor(1, days_ago=days)]), TODAY)
+    assert bool(df.eligible.iloc[0]) is ok
+
+
+def test_ineligible_donors_never_ranked():
+    df = pd.DataFrame([donor(1, days_ago=30), donor(2, days_ago=120), donor(3)])
+    top, meta = rank_donors(df, "O+", 31.52, 74.36, TODAY)
+    assert set(top.donor_id) == {"D0002", "D0003"}
+    assert meta["excluded_ineligible_90d"] == 1
+
+
+# --- compatibility ---------------------------------------------------------
+def test_compatibility_table():
+    assert COMPATIBLE_DONORS["O-"] == ["O-"]
+    assert len(COMPATIBLE_DONORS["AB+"]) == 8
+    for recipient, donors in COMPATIBLE_DONORS.items():
+        assert "O-" in donors                       # universal red-cell donor
+        if recipient.endswith("-"):
+            assert all(d.endswith("-") for d in donors)   # Rh- gets only Rh-
+
+
+def test_exact_match_beats_universal_o_neg():
+    df = pd.DataFrame([donor(1, "O-"), donor(2, "A+")])
+    top, _ = rank_donors(df, "A+", 31.52, 74.36, TODAY)
+    assert top.donor_id.iloc[0] == "D0002"
+
+
+def test_paused_and_incompatible_excluded():
+    df = pd.DataFrame([donor(1, "B+"), donor(2, "O+", avail="Paused"), donor(3, "O+")])
+    top, _ = rank_donors(df, "O+", 31.52, 74.36, TODAY)
+    assert list(top.donor_id) == ["D0003"]
+
+
+def test_radius_expands_when_too_few_nearby():
+    near = [donor(i, lat=31.52, lon=74.36) for i in range(2)]
+    far = [donor(10 + i, lat=31.75, lon=74.36) for i in range(6)]   # ~25 km away
+    top, meta = rank_donors(pd.DataFrame(near + far), "O+", 31.52, 74.36, TODAY, units=1)
+    assert meta["radius_expanded"] and meta["radius_used_km"] >= 25
+    assert len(top) == 8
+
+
+# --- recurring patients ----------------------------------------------------
+def test_recurring_plan_respects_90_days():
+    # 5 sessions x (2 primaries + 1 backup) inside 90 days needs 15 distinct donors
+    hosp = pd.DataFrame([{"hospital_id": "H1", "lat": 31.52, "lon": 74.36}])
+    patient = pd.Series({"blood_type": "B+", "hospital_id": "H1", "units_per_session": 2,
+                         "interval_days": 21, "next_transfusion": pd.Timestamp(TODAY)})
+    sched, summary = plan_recurring(patient, pd.DataFrame([donor(i, "B+") for i in range(16)]),
+                                    hosp, TODAY, sessions=5)
+    assert summary["uncovered_units"] == 0
+    for _, g in sched.groupby("donor_id"):
+        dates = sorted(pd.to_datetime(g.session))
+        assert all((b - a).days >= 90 for a, b in zip(dates, dates[1:]))
+
+    # too small a pool is reported, never silently double-booked
+    _, small = plan_recurring(patient, pd.DataFrame([donor(i, "B+") for i in range(6)]),
+                              hosp, TODAY, sessions=5)
+    assert small["uncovered_units"] > 0
+
+
+# --- privacy ---------------------------------------------------------------
+def test_hospital_view_hides_identity():
+    df = pd.DataFrame([donor(1), donor(2)])
+    top, _ = rank_donors(df, "O+", 31.52, 74.36, TODAY)
+    view, ref_map = hospital_view(top, "REQ-1", "O+")
+    forbidden = {"donor_id", "lat", "lon", "phone", "name", "distance_km", "last_donation"}
+    assert not forbidden & set(view.columns)
+    assert not set(view["Donor ref"]) & set(df.donor_id)
+    assert set(ref_map.values()) == set(top.donor_id)
+
+
+def test_refs_are_request_scoped():
+    assert request_ref("D0001", "REQ-1") != request_ref("D0001", "REQ-2")
+    assert request_ref("D0001", "REQ-1") == request_ref("D0001", "REQ-1")
+
+
+def test_distance_is_bucketed():
+    assert distance_bucket(0.4) == "< 2 km" and distance_bucket(7) == "5-10 km"
+
+
+def test_relay_rate_limit_and_audit():
+    relay = ContactRelay(max_per_hour=5)
+    donors = pd.DataFrame([donor(i) for i in range(6)])
+    refs = {f"R{i}": f"D{i:04d}" for i in range(4)}
+    out = relay.notify("H1", "REQ-1", refs, donors, "O+", {}, seed=0)
+    assert len(out) == 4 and len(relay.audit) == 1
+    with pytest.raises(RateLimitExceeded):
+        relay.notify("H1", "REQ-2", refs, donors, "O+", {}, seed=0)
 
