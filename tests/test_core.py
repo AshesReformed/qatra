@@ -1,4 +1,4 @@
-"""Core rule tests. Run: python -m pytest -q"""
+""" Core rule tests. Run: python -m pytest -q"""
 from datetime import date, timedelta
 
 import pandas as pd
