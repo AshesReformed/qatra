@@ -1,115 +1,100 @@
-"""Core rule tests. Run: python -m pytest -q"""
-from datetime import date, timedelta
+"""Static configuration: cities, blood-type shares, calendar effects.
 
+Every number here is an assumption used to generate SYNTHETIC data. Blood-group
+shares are approximate figures in line with published Pakistani donor studies
+(B+ is the most common group in Pakistan); they vary by region and study.
+"""
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
-import pytest
 
-from qatra.matching import (COMPATIBLE_DONORS, add_eligibility, is_eligible,
-                            plan_recurring, rank_donors)
-from qatra.privacy import (ContactRelay, RateLimitExceeded, distance_bucket,
-                           hospital_view, request_ref)
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"
 
-TODAY = date(2026, 10, 4)
+ELIGIBILITY_DAYS = 90          # minimum gap between whole-blood donations
+MIN_AGE, MAX_AGE = 18, 60      # typical donor criteria used for form validation
+MIN_WEIGHT_KG = 50
 
+BLOOD_TYPES = ["O+", "O-", "A+", "A-", "B+", "B-", "AB+", "AB-"]
 
-def donor(i, bt="O+", days_ago=None, avail="Available now", lat=31.52, lon=74.36, rr=0.6):
-    return {"donor_id": f"D{i:04d}", "blood_type": bt, "city": "Lahore", "lat": lat, "lon": lon,
-            "last_donation": None if days_ago is None else TODAY - timedelta(days=days_ago),
-            "availability": avail, "response_rate": rr, "last_contacted": None,
-            "consent_matching": True, "consent_contact": True}
+# Share of each group among donors (approximate, sums to 1.0).
+DONOR_TYPE_SHARE = {
+    "B+": 0.32, "O+": 0.29, "A+": 0.22, "AB+": 0.08,
+    "B-": 0.03, "O-": 0.03, "A-": 0.02, "AB-": 0.01,
+}
+# Share of each group among requests. Negatives are over-represented relative to
+# donors because O- is used as the emergency universal red-cell group and
+# Rh-negative patients cannot take Rh-positive blood.
+DEMAND_TYPE_SHARE = {
+    "B+": 0.30, "O+": 0.28, "A+": 0.21, "AB+": 0.07,
+    "B-": 0.035, "O-": 0.055, "A-": 0.03, "AB-": 0.02,
+}
 
+# weight ~ relative population (millions, rounded); dengue = relative dengue exposure
+CITIES = {
+    "Karachi":    dict(code="KHI", lat=24.8607, lon=67.0011, weight=16.0, dengue=1.0),
+    "Lahore":     dict(code="LHE", lat=31.5204, lon=74.3587, weight=13.0, dengue=1.0),
+    "Faisalabad": dict(code="LYP", lat=31.4504, lon=73.1350, weight=3.6, dengue=0.6),
+    "Rawalpindi": dict(code="RWP", lat=33.5651, lon=73.0169, weight=2.3, dengue=1.0),
+    "Gujranwala": dict(code="GRW", lat=32.1877, lon=74.1945, weight=2.3, dengue=0.6),
+    "Peshawar":   dict(code="PEW", lat=34.0151, lon=71.5249, weight=2.3, dengue=0.7),
+    "Multan":     dict(code="MUX", lat=30.1968, lon=71.4782, weight=2.2, dengue=0.5),
+    "Hyderabad":  dict(code="HDD", lat=25.3960, lon=68.3578, weight=1.9, dengue=0.5),
+    "Quetta":     dict(code="UET", lat=30.1798, lon=66.9750, weight=1.6, dengue=0.2),
+    "Islamabad":  dict(code="ISB", lat=33.6844, lon=73.0479, weight=1.2, dengue=1.0),
+    "Sialkot":    dict(code="SKT", lat=32.4945, lon=74.5229, weight=0.9, dengue=0.5),
+}
 
-# --- 90-day rule -----------------------------------------------------------
-@pytest.mark.parametrize("days,ok", [(None, True), (89, False), (90, True), (200, True), (0, False)])
-def test_ninety_day_rule(days, ok):
-    last = None if days is None else TODAY - timedelta(days=days)
-    assert is_eligible(last, TODAY) is ok
-    df = add_eligibility(pd.DataFrame([donor(1, days_ago=days)]), TODAY)
-    assert bool(df.eligible.iloc[0]) is ok
-
-
-def test_ineligible_donors_never_ranked():
-    df = pd.DataFrame([donor(1, days_ago=30), donor(2, days_ago=120), donor(3)])
-    top, meta = rank_donors(df, "O+", 31.52, 74.36, TODAY)
-    assert set(top.donor_id) == {"D0002", "D0003"}
-    assert meta["excluded_ineligible_90d"] == 1
-
-
-# --- compatibility ---------------------------------------------------------
-def test_compatibility_table():
-    assert COMPATIBLE_DONORS["O-"] == ["O-"]
-    assert len(COMPATIBLE_DONORS["AB+"]) == 8
-    for recipient, donors in COMPATIBLE_DONORS.items():
-        assert "O-" in donors                       # universal red-cell donor
-        if recipient.endswith("-"):
-            assert all(d.endswith("-") for d in donors)   # Rh- gets only Rh-
-
-
-def test_exact_match_beats_universal_o_neg():
-    df = pd.DataFrame([donor(1, "O-"), donor(2, "A+")])
-    top, _ = rank_donors(df, "A+", 31.52, 74.36, TODAY)
-    assert top.donor_id.iloc[0] == "D0002"
-
-
-def test_paused_and_incompatible_excluded():
-    df = pd.DataFrame([donor(1, "B+"), donor(2, "O+", avail="Paused"), donor(3, "O+")])
-    top, _ = rank_donors(df, "O+", 31.52, 74.36, TODAY)
-    assert list(top.donor_id) == ["D0003"]
-
-
-def test_radius_expands_when_too_few_nearby():
-    near = [donor(i, lat=31.52, lon=74.36) for i in range(2)]
-    far = [donor(10 + i, lat=31.75, lon=74.36) for i in range(6)]   # ~25 km away
-    top, meta = rank_donors(pd.DataFrame(near + far), "O+", 31.52, 74.36, TODAY, units=1)
-    assert meta["radius_expanded"] and meta["radius_used_km"] >= 25
-    assert len(top) == 8
+# Approximate Ramadan windows and Eid days (dates shift with moon sighting).
+RAMADAN = [
+    (date(2023, 3, 23), date(2023, 4, 21)),
+    (date(2024, 3, 11), date(2024, 4, 9)),
+    (date(2025, 3, 1), date(2025, 3, 30)),
+    (date(2026, 2, 18), date(2026, 3, 19)),
+    (date(2027, 2, 8), date(2027, 3, 9)),
+]
+EIDS = [
+    date(2023, 4, 22), date(2023, 6, 29),
+    date(2024, 4, 10), date(2024, 6, 17),
+    date(2025, 3, 31), date(2025, 6, 7),
+    date(2026, 3, 20), date(2026, 5, 27),
+    date(2027, 3, 10), date(2027, 5, 16),
+]
 
 
-# --- recurring patients ----------------------------------------------------
-def test_recurring_plan_respects_90_days():
-    # 5 sessions x (2 primaries + 1 backup) inside 90 days needs 15 distinct donors
-    hosp = pd.DataFrame([{"hospital_id": "H1", "lat": 31.52, "lon": 74.36}])
-    patient = pd.Series({"blood_type": "B+", "hospital_id": "H1", "units_per_session": 2,
-                         "interval_days": 21, "next_transfusion": pd.Timestamp(TODAY)})
-    sched, summary = plan_recurring(patient, pd.DataFrame([donor(i, "B+") for i in range(16)]),
-                                    hosp, TODAY, sessions=5)
-    assert summary["uncovered_units"] == 0
-    for _, g in sched.groupby("donor_id"):
-        dates = sorted(pd.to_datetime(g.session))
-        assert all((b - a).days >= 90 for a, b in zip(dates, dates[1:]))
-
-    # too small a pool is reported, never silently double-booked
-    _, small = plan_recurring(patient, pd.DataFrame([donor(i, "B+") for i in range(6)]),
-                              hosp, TODAY, sessions=5)
-    assert small["uncovered_units"] > 0
+def _as_index(d) -> pd.DatetimeIndex:
+    return pd.DatetimeIndex(pd.to_datetime(d))
 
 
-# --- privacy ---------------------------------------------------------------
-def test_hospital_view_hides_identity():
-    df = pd.DataFrame([donor(1), donor(2)])
-    top, _ = rank_donors(df, "O+", 31.52, 74.36, TODAY)
-    view, ref_map = hospital_view(top, "REQ-1", "O+")
-    forbidden = {"donor_id", "lat", "lon", "phone", "name", "distance_km", "last_donation"}
-    assert not forbidden & set(view.columns)
-    assert not set(view["Donor ref"]) & set(df.donor_id)
-    assert set(ref_map.values()) == set(top.donor_id)
+def dengue_shape(d) -> np.ndarray:
+    """Seasonal dengue curve: peaks mid-October (post-monsoon), 0..1."""
+    doy = _as_index(d).dayofyear.to_numpy()
+    return np.exp(-0.5 * ((doy - 288) / 28.0) ** 2)
 
 
-def test_refs_are_request_scoped():
-    assert request_ref("D0001", "REQ-1") != request_ref("D0001", "REQ-2")
-    assert request_ref("D0001", "REQ-1") == request_ref("D0001", "REQ-1")
+def summer_shape(d) -> np.ndarray:
+    """Peak-summer heat curve (donations dip), 0..1, centred late June."""
+    doy = _as_index(d).dayofyear.to_numpy()
+    return np.exp(-0.5 * ((doy - 180) / 25.0) ** 2)
 
 
-def test_distance_is_bucketed():
-    assert distance_bucket(0.4) == "< 2 km" and distance_bucket(7) == "5-10 km"
+def ramadan_flag(d) -> np.ndarray:
+    idx = _as_index(d)
+    out = np.zeros(len(idx))
+    for start, end in RAMADAN:
+        out[(idx >= pd.Timestamp(start)) & (idx <= pd.Timestamp(end))] = 1.0
+    return out
 
 
-def test_relay_rate_limit_and_audit():
-    relay = ContactRelay(max_per_hour=5)
-    donors = pd.DataFrame([donor(i) for i in range(6)])
-    refs = {f"R{i}": f"D{i:04d}" for i in range(4)}
-    out = relay.notify("H1", "REQ-1", refs, donors, "O+", {}, seed=0)
-    assert len(out) == 4 and len(relay.audit) == 1
-    with pytest.raises(RateLimitExceeded):
-        relay.notify("H1", "REQ-2", refs, donors, "O+", {}, seed=0)
-
+def eid_flag(d, window: int = 3) -> np.ndarray:
+    """1 within +/- `window` days of an Eid (travel, road accidents)."""
+    idx = _as_index(d)
+    out = np.zeros(len(idx))
+    for e in EIDS:
+        delta = (idx - pd.Timestamp(e)).days
+        out[np.abs(delta) <= window] = 1.0
+    return out
